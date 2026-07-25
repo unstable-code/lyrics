@@ -202,15 +202,17 @@ bool lyrics_manager_load_lyrics(struct lyrics_state *state) {
     if (!lyrics_find_for_track(&state->playback.current_track, &state->playback.lyrics)) {
         log_info("No lyrics found for current track");
 
-        // Even without lyrics, try to update album art with MPRIS metadata
-        if (g_config.lyrics.enable_itunes) {
-            system_tray_update_icon_with_fallback(
-                state->playback.current_track.art_url,
-                state->playback.current_track.artist,
-                state->playback.current_track.album,
-                state->playback.current_track.title
-            );
-        }
+        // Even without lyrics, try to update album art. Don't gate on
+        // enable_itunes here: cache, MPRIS art, and local embedded-cover
+        // extraction all work offline; try_itunes_artwork self-gates on the
+        // setting for the online step.
+        system_tray_update_icon_with_fallback(
+            state->playback.current_track.art_url,
+            state->playback.current_track.url,
+            state->playback.current_track.artist,
+            state->playback.current_track.album,
+            state->playback.current_track.title
+        );
 
         // Send notification even without lyrics
         if (g_config.lyrics.enable_notifications) {
@@ -259,7 +261,9 @@ bool lyrics_manager_load_lyrics(struct lyrics_state *state) {
     // Update album art (try MPRIS URL first, then iTunes API)
     log_info("Updating album art with metadata (artist: %s, album: %s, title: %s)",
              artist ? artist : "Unknown", album ? album : "Unknown", title ? title : "Unknown");
-    system_tray_update_icon_with_fallback(state->playback.current_track.art_url, artist, album, title);
+    system_tray_update_icon_with_fallback(state->playback.current_track.art_url,
+                                          state->playback.current_track.url,
+                                          artist, album, title);
 
     // Send desktop notification after album art is updated
     if (g_config.lyrics.enable_notifications) {

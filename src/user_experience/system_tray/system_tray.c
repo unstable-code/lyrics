@@ -6,6 +6,7 @@
 #include "../../provider/itunes/itunes_artwork.h"
 #include "../../utils/file/file_utils.h"
 #include "../../utils/icon/icon_utils.h"
+#include "../../utils/url/url_utils.h"
 #include "../../core/rendering/rendering_manager.h"
 #include "../config/config.h"
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <libappindicator/app-indicator.h>
 #include <gtk/gtk.h>
@@ -964,6 +966,196 @@ static bool try_mpris_artwork(const char *art_url, const char *cache_path, const
     return success;
 }
 
+// Resolve a file:// MPRIS URI to a canonical local regular-file path.
+// Returns true and fills `resolved` (must be PATH_MAX) on success; false for a
+// NULL/non-local URI, a decode failure, an unresolvable path, or a non-regular
+// file. Canonicalizing and requiring S_ISREG keeps a device/FIFO/pseudo-file
+// from ever being handed to ffmpeg (CWE-73), mirroring load_image_from_url.
+static bool resolve_local_media_path(const char *file_url, char *resolved) {
+    if (!file_url || strncmp(file_url, "file://", 7) != 0) {
+        return false;
+    }
+
+    // MPRIS gives percent-encoded file:// URIs; decode to a real path first.
+    char *decoded = url_decode_string(file_url + 7);
+    if (!decoded) {
+        return false;
+    }
+
+    bool ok = (realpath(decoded, resolved) != NULL);
+    free(decoded);
+    if (!ok) {
+        log_warn("system_tray: cannot resolve local media path, skipping extraction");
+        return false;
+    }
+
+    struct stat st;
+    if (stat(resolved, &st) != 0 || !S_ISREG(st.st_mode)) {
+        log_warn("system_tray: local media path is not a regular file, skipping extraction");
+        return false;
+    }
+    return true;
+}
+
+// Run ffmpeg with the given argument vector and report whether it produced a
+// usable PNG at out_path. g_spawn_sync runs ffmpeg with no shell interpretation
+// so the resolved path can never be reinterpreted as arguments. ffmpeg exits
+// non-zero when the requested stream is absent; it can also exit zero yet write
+// nothing (e.g. a seek past end-of-file), so the output file is stat-checked
+// explicitly rather than trusting the exit code alone.
+static bool run_ffmpeg_extract(char **argv, const char *out_path) {
+    gint wait_status = 0;
+    GError *error = NULL;
+    bool spawned = g_spawn_sync(NULL, argv, NULL,
+                                G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL |
+                                    G_SPAWN_STDERR_TO_DEV_NULL,
+                                NULL, NULL, NULL, NULL, &wait_status, &error);
+    if (!spawned) {
+        log_warn("ffmpeg spawn failed: %s", error ? error->message : "unknown");
+        if (error) {
+            g_error_free(error);
+        }
+        return false;
+    }
+
+    if (!WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+        return false;
+    }
+
+    struct stat st;
+    if (stat(out_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        return false;
+    }
+    return true;
+}
+
+// Hand a freshly extracted PNG to the validated file:// decode path, remove the
+// temp file, and cache it under the metadata hash on success.
+static bool commit_local_art(const char *out_path, const char *cache_path,
+                             const char *metadata_hash) {
+    char out_url[700];
+    snprintf(out_url, sizeof(out_url), "file://%s", out_path);
+    bool success = system_tray_update_icon(out_url);
+    unlink(out_path);
+
+    if (success && metadata_hash[0] != '\0') {
+        cache_current_artwork(cache_path);
+        snprintf(last_metadata_hash, sizeof(last_metadata_hash), "%s", metadata_hash);
+    }
+    return success;
+}
+
+// Extract embedded cover art from a local file via ffmpeg. This is the offline
+// fallback for players (e.g. mpv) that never expose mpris:artUrl even when the
+// file on disk carries an embedded cover. It runs before the iTunes API so a
+// local track resolves without any network round-trip. ffmpeg is an optional
+// runtime dependency: when absent, return false and let the next source take
+// over. Returns true only when a cover was extracted and set as the icon.
+static bool try_local_embedded_artwork(const char *file_url, const char *cache_path,
+                                       const char *metadata_hash) {
+    char resolved[PATH_MAX];
+    if (!resolve_local_media_path(file_url, resolved)) {
+        return false;
+    }
+
+    char *ffmpeg = g_find_program_in_path("ffmpeg");
+    if (!ffmpeg) {
+        log_info("ffmpeg not found, skipping local artwork extraction");
+        return false;
+    }
+
+    char out_path[600];
+    snprintf(out_path, sizeof(out_path), "%s/embedded-art.png", get_runtime_dir());
+    unlink(out_path);
+
+    // The stream selection is deliberate: "-map 0:v -map -0:V" keeps all video
+    // streams then removes the non-attached-picture ones, leaving ONLY the
+    // attached cover art. A plain "-frames:v 1" would instead grab the first
+    // frame of a real video stream (e.g. an .mkv), so a video file would yield a
+    // random still rather than correctly reporting "no cover". With this mapping
+    // a file that has no attached_pic produces no output stream and ffmpeg exits
+    // non-zero, which we treat as "no embedded artwork".
+    char *argv[] = {
+        ffmpeg, "-y", "-loglevel", "error",
+        "-i", resolved,
+        "-map", "0:v", "-map", "-0:V",
+        "-frames:v", "1",
+        "-f", "image2", "-c:v", "png",
+        out_path, NULL
+    };
+
+    bool extracted = run_ffmpeg_extract(argv, out_path);
+    g_free(ffmpeg);
+    if (!extracted) {
+        log_info("No embedded cover art in local file");
+        unlink(out_path);
+        return false;
+    }
+
+    bool success = commit_local_art(out_path, cache_path, metadata_hash);
+    if (success) {
+        log_info("Using embedded album art from local file");
+    }
+    return success;
+}
+
+// Seek offset (seconds) for the video-thumbnail grab. A small non-zero offset
+// skips black/blank intro frames that many videos open with; the `thumbnail`
+// filter then picks a representative frame from the following batch.
+#define VIDEO_THUMBNAIL_SEEK_SECONDS "3"
+
+// Grab a representative frame from a local video file as the tray icon, used
+// only when the file has no embedded cover (e.g. a downloaded music-video
+// .mkv). Selects the first real (non-attached-picture) video stream via
+// "0:V:0" — an audio-only file matches no stream and ffmpeg exits non-zero, so
+// this never fires for pure audio. The frame is centre-cropped to a square and
+// scaled so it passes the tray's square-image requirement. Runs before iTunes
+// so a local video resolves offline. Returns true only when a thumbnail was set.
+static bool try_local_video_thumbnail(const char *file_url, const char *cache_path,
+                                      const char *metadata_hash) {
+    char resolved[PATH_MAX];
+    if (!resolve_local_media_path(file_url, resolved)) {
+        return false;
+    }
+
+    char *ffmpeg = g_find_program_in_path("ffmpeg");
+    if (!ffmpeg) {
+        log_info("ffmpeg not found, skipping local video thumbnail");
+        return false;
+    }
+
+    char out_path[600];
+    snprintf(out_path, sizeof(out_path), "%s/video-thumb.png", get_runtime_dir());
+    unlink(out_path);
+
+    // Filtergraph commas inside min(iw,ih) are escaped (\,) so ffmpeg does not
+    // read them as filter separators. No shell is involved (g_spawn_sync), so
+    // the backslashes are passed literally as ffmpeg wants.
+    char *argv[] = {
+        ffmpeg, "-y", "-loglevel", "error",
+        "-ss", VIDEO_THUMBNAIL_SEEK_SECONDS,
+        "-i", resolved,
+        "-map", "0:V:0", "-frames:v", "1",
+        "-vf", "thumbnail,crop=min(iw\\,ih):min(iw\\,ih),scale=256:256",
+        "-f", "image2", "-c:v", "png",
+        out_path, NULL
+    };
+
+    bool extracted = run_ffmpeg_extract(argv, out_path);
+    g_free(ffmpeg);
+    if (!extracted) {
+        log_info("No video thumbnail extracted from local file");
+        unlink(out_path);
+        return false;
+    }
+
+    bool success = commit_local_art(out_path, cache_path, metadata_hash);
+    if (success) {
+        log_info("Using video thumbnail from local file");
+    }
+    return success;
+}
+
 // Try to get artwork from iTunes API
 static bool try_itunes_artwork(const char *artist, const char *album, const char *track,
                                const char *cache_path, const char *metadata_hash) {
@@ -995,7 +1187,7 @@ static bool try_itunes_artwork(const char *artist, const char *album, const char
     return false;
 }
 
-bool system_tray_update_icon_with_fallback(const char *art_url, const char *artist, const char *album, const char *track) {
+bool system_tray_update_icon_with_fallback(const char *art_url, const char *file_url, const char *artist, const char *album, const char *track) {
     // Calculate metadata hash for caching (using artist + track + album)
     char metadata_hash[MD5_DIGEST_STRING_LENGTH];
     if (!calculate_metadata_md5(artist, track, album, metadata_hash)) {
@@ -1019,11 +1211,17 @@ bool system_tray_update_icon_with_fallback(const char *art_url, const char *arti
     }
 
     // Try sources in priority order — local cache (fastest, no network) →
-    // MPRIS art URL → iTunes API. The first hit leaves the artwork cached, so
-    // a single call sets the tray icon from that cache. Short-circuiting ||
-    // preserves the sequential-fallback semantics.
+    // MPRIS art URL → local file embedded cover → local video thumbnail →
+    // iTunes API. The first hit leaves the artwork cached, so a single call
+    // sets the tray icon from that cache. Short-circuiting || preserves the
+    // sequential-fallback semantics. The two ffmpeg-based local steps sit
+    // before iTunes so a local track whose player omits mpris:artUrl still
+    // resolves offline: an embedded cover if the file has one, otherwise a
+    // centre-cropped frame for video files.
     if ((cache_path[0] != '\0' && load_cached_album_art(cache_path, metadata_hash)) ||
         try_mpris_artwork(art_url, cache_path, metadata_hash) ||
+        try_local_embedded_artwork(file_url, cache_path, metadata_hash) ||
+        try_local_video_thumbnail(file_url, cache_path, metadata_hash) ||
         try_itunes_artwork(artist, album, track, cache_path, metadata_hash)) {
         set_indicator_icon_cached(metadata_hash);
         return true;

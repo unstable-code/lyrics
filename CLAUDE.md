@@ -120,7 +120,7 @@ To hide the overlay (e.g. during an instrumental break), `rendering_manager_rend
 
 ### System Tray
 
-`src/user_experience/system_tray/system_tray.c` uses libappindicator-gtk3 to publish an SNI tray icon. Album art fallback chain: MPRIS metadata → iTunes Search API (`src/provider/itunes/itunes_artwork.c`) → default theme icon. Tray menu has track info, overlay toggle, timing offset submenu, and "Edit Settings" (needs `$EDITOR` and `$TERMINAL`).
+`src/user_experience/system_tray/system_tray.c` uses libappindicator-gtk3 to publish an SNI tray icon. Album art fallback chain: per-track cache (`~/.cache/wshowlyrics/album_art/{md5}.png`) → MPRIS `mpris:artUrl` → local file embedded cover (`try_local_embedded_artwork`) → local video thumbnail (`try_local_video_thumbnail`) → iTunes Search API (`src/provider/itunes/itunes_artwork.c`) → default theme icon. The two `ffmpeg`-based local steps extract from `xesam:url` and run before iTunes so a local track whose player omits `mpris:artUrl` (e.g. mpv) still resolves offline: the embedded step maps only the `attached_pic` stream (`-map 0:v -map -0:V`, so it never grabs a real video frame), and the thumbnail step centre-crops a representative frame (`-map 0:V:0` + `thumbnail,crop,scale`) for video files with no embedded cover. `ffmpeg` is an optional runtime dep — both steps degrade to iTunes when it is absent. Shared helpers: `resolve_local_media_path` (decode + `realpath` + regular-file check), `run_ffmpeg_extract` (spawn + exit/output verify), `commit_local_art` (validated decode + cache). Tray menu has track info, overlay toggle, timing offset submenu, and "Edit Settings" (needs `$EDITOR` and `$TERMINAL`).
 
 ### Configuration
 
@@ -253,7 +253,7 @@ See `docs/TESTING.md` for the Unicode-path scenarios.
 
 **Build**: cairo, pango, pangocairo, fontconfig, wayland-client, wayland-protocols, libcurl, openssl, json-c, libappindicator-gtk3 (`appindicator3-0.1`), gdk-pixbuf-2.0, gio-2.0, librt, meson, ninja. Optional: libexttextcat (language detection).
 
-**Runtime**: playerctl, a `wlr-layer-shell` compositor (Sway, Hyprland, KDE Plasma 5.27+).
+**Runtime**: playerctl, a `wlr-layer-shell` compositor (Sway, Hyprland, KDE Plasma 5.27+). Optional: `ffmpeg` (extracts embedded cover art from local files for the tray icon; without it that fallback step is skipped).
 
 ## Helper Scripts
 
