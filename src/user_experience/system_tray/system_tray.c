@@ -163,6 +163,28 @@ static bool is_square_image(GdkPixbuf *const pixbuf) {
     return (ratio >= 0.95f && ratio <= 1.05f);
 }
 
+// Centre-crop a non-square pixbuf to a square (side = shorter edge). Used so a
+// rectangular remote thumbnail — e.g. a 480x360 YouTube cover exposed via
+// mpris:artUrl — becomes a usable square tray icon instead of being discarded.
+// Returns a new pixbuf the caller owns, or NULL on failure.
+static GdkPixbuf* crop_to_square(GdkPixbuf *const pixbuf) {
+    int width = gdk_pixbuf_get_width(pixbuf);
+    int height = gdk_pixbuf_get_height(pixbuf);
+    int side = width < height ? width : height;
+    int x = (width - side) / 2;
+    int y = (height - side) / 2;
+
+    // new_subpixbuf shares the source pixels (and holds a ref on it); copy to an
+    // independent buffer so the square survives after the source is unref'd.
+    GdkPixbuf *view = gdk_pixbuf_new_subpixbuf(pixbuf, x, y, side, side);
+    if (!view) {
+        return NULL;
+    }
+    GdkPixbuf *square = gdk_pixbuf_copy(view);
+    g_object_unref(view);
+    return square;
+}
+
 // Save default icon from theme to file
 static bool save_default_icon(const char *output_path) {
     GtkIconTheme *icon_theme = gtk_icon_theme_get_default();
@@ -330,13 +352,21 @@ static GdkPixbuf* load_image_from_url(const char *url) {
         curl_memory_buffer_free(&buffer);
     }
 
-    // Verify image is approximately square (allow 5% tolerance)
+    // A tray icon must be square. Rather than discard a rectangular image
+    // (which would drop e.g. a 480x360 YouTube thumbnail from mpris:artUrl and
+    // fall back to the default icon), centre-crop it to a square. Images already
+    // within the 5% tolerance are left untouched.
     if (pixbuf && !is_square_image(pixbuf)) {
         int width = gdk_pixbuf_get_width(pixbuf);
         int height = gdk_pixbuf_get_height(pixbuf);
-        log_warn("Image aspect ratio too far from square (%dx%d), using default icon", width, height);
+        GdkPixbuf *square = crop_to_square(pixbuf);
         g_object_unref(pixbuf);
-        return NULL;
+        if (!square) {
+            log_warn("Failed to centre-crop %dx%d image, using default icon", width, height);
+            return NULL;
+        }
+        log_info("Centre-cropped %dx%d image to square for tray icon", width, height);
+        pixbuf = square;
     }
 
     return pixbuf;
