@@ -117,6 +117,7 @@ static bool setup_deepl_curl_request(CURL **curl_out,
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, response) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT_STRING) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L) != CURLE_OK) {
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);

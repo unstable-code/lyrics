@@ -819,7 +819,8 @@ static struct curl_slist* setup_translator_curl_request(CURL *curl,
     if (curl_easy_setopt(curl, CURLOPT_URL, params->endpoint) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, params->request_body) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, translator_curl_write_callback) != CURLE_OK ||
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, response) != CURLE_OK) {
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, response) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK) {
         log_error("%s: Failed to set CURL options", params->provider_name);
         return NULL;
     }

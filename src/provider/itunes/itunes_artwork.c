@@ -38,6 +38,8 @@ static bool setup_itunes_request(CURL *curl, const char *url,
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)response) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT_STRING) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L) != CURLE_OK) {
         log_error("iTunes: Failed to set CURL options");
         return false;

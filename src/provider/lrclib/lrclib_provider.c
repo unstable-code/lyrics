@@ -61,6 +61,8 @@ static bool perform_lrclib_request(CURL *curl, const char *url, struct curl_memo
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)response) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT_STRING) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L) != CURLE_OK) {
         log_error("lrclib: Failed to set CURL options");
         curl_memory_buffer_free(response);
@@ -251,6 +253,8 @@ static bool setup_lrclib_request(CURL *curl, const char *url,
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)response) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT_STRING) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L) != CURLE_OK) {
         log_error("lrclib: Failed to set CURL options");
         return false;
