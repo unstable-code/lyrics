@@ -106,9 +106,13 @@ static struct best_match_result find_best_match_in_results(
         int64_t result_duration = json_extract_int_from(response_data, "duration", obj_start);
         char *synced_lyrics = json_extract_string(obj_start, "syncedLyrics");
 
-        // Skip entries without valid synced lyrics
+        // Skip entries without valid synced lyrics. Advance to the next object
+        // first — a bare `continue` would leave obj_start pinned to this entry
+        // and spin the loop forever (100% CPU) whenever a result carries only
+        // plainLyrics, which is common for J-POP / instrumental tracks.
         if (!synced_lyrics || synced_lyrics[0] == '\0') {
             free(synced_lyrics);
+            obj_start = strchr(search_pos, '{');
             continue;
         }
 
