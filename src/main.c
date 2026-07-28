@@ -324,13 +324,24 @@ static void monitor_track_and_files(struct lyrics_state *state, int *update_coun
     // so mpris_get_metadata() queries DBus - if same track, no reload
     if (mpris_check_metadata_changed() &&
         lyrics_manager_update_track_info(state)) {
-        lyrics_manager_load_lyrics(state);
+        // Kick off the (blocking, network) search on a worker thread so the main
+        // loop keeps rendering/servicing input; the result is installed by
+        // lyrics_manager_poll_load below once the worker finishes.
+        lyrics_manager_begin_load(state);
         mpris_apply_position_fix_if_needed();
         rendering_manager_set_dirty(state);
     }
 
-    // Check if lyrics or config files have changed (every 2 seconds)
-    if ((*update_counter)++ % TRACK_UPDATE_CHECK_INTERVAL == 0) {
+    // Install a completed async fetch (this or a previous tick's).
+    lyrics_manager_poll_load(state);
+
+    // Check if lyrics or config files have changed (every 2 seconds).
+    // Skip while an async fetch is running: the worker reads g_config in the
+    // provider chain, and a config reload here would config_free() those strings
+    // out from under it (use-after-free). Fetches are short; the reload just
+    // waits for the next check.
+    if (!state->playback.async_fetch.thread_active &&
+        (*update_counter)++ % TRACK_UPDATE_CHECK_INTERVAL == 0) {
         if (state->playback.lyrics.source_file_path &&
             !path_is_in_cache_dir(state->playback.lyrics.source_file_path)) {
             file_monitor_check_and_reload(
@@ -409,6 +420,10 @@ static void handle_instrumental_break(struct lyrics_state *state) {
                 state->playback.current_line = NULL;
                 state->playback.prev_line = NULL;
                 state->playback.next_line = NULL;
+                // The provider chain no longer starts translation itself.
+                state->playback.lyrics.translation_should_cancel = false;
+                lyrics_provider_translate(&state->playback.lyrics,
+                                          state->playback.current_track.length_us);
                 rendering_manager_set_dirty(state);
             } else {
                 log_info("No lyrics found, keeping existing lyrics displayed");
@@ -486,6 +501,7 @@ static void cleanup_resources(struct lyrics_state *state, char *font_from_config
 
     dbus_control_cleanup();
     system_tray_cleanup();
+    lyrics_manager_cancel_fetch(state);
     cancel_and_wait_translation(&state->playback.lyrics);
     lrc_free_data(&state->playback.lyrics);
     mpris_free_metadata(&state->playback.current_track);

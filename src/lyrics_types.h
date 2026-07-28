@@ -70,10 +70,27 @@ struct lyrics_data {
     _Atomic int translation_total;
 };
 
+// Async lyrics fetch — the (blocking, network) provider search runs on a worker
+// thread so it never stalls the main poll() loop. The worker fills `result` (a
+// buffer private to the fetch, never the live lyrics) and flips `ready`; the main
+// thread then swaps `result` into the live lyrics and runs the GTK/render/
+// translation steps that must stay on the main thread.
+struct async_lyrics_fetch {
+    pthread_t thread;
+    _Atomic bool thread_active;   // true between pthread_create and join
+    _Atomic bool in_progress;     // worker is still running
+    _Atomic bool ready;           // worker finished; result awaits consumption
+    _Atomic bool should_cancel;   // ask the worker (and its curl transfer) to abort
+    _Atomic bool found;           // worker outcome: lyrics were found
+    struct lyrics_data result;    // worker-private result buffer
+    struct track_metadata track;  // deep-copied track snapshot the worker fetches for
+};
+
 // Playback state - currently playing track, current/prev/next lines, timing
 struct playback_state {
     struct lyrics_data lyrics;
     struct track_metadata current_track;
+    struct async_lyrics_fetch async_fetch;  // off-main-thread lyrics search
     struct lyrics_line *current_line;
     int current_line_index; // 0-based index of current_line in lyrics.lines (-1 if no current line)
     struct word_segment *current_segment; // For karaoke highlighting (LRCX)

@@ -4,6 +4,7 @@
 #include "../core/rendering/rendering_manager.h"
 #include "../utils/mpris/mpris.h"
 #include "../provider/lyrics/lyrics_provider.h"
+#include "../provider/lrclib/lrclib_provider.h"
 #include "../user_experience/system_tray/system_tray.h"
 #include "../parser/lrc/lrc_common.h"
 #include "../utils/file/file_utils.h"
@@ -12,6 +13,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <stdatomic.h>
 
 bool lyrics_manager_is_format(const struct lyrics_state *state, const char *extension) {
     if (!state->playback.lyrics.source_file_path) {
@@ -176,13 +178,15 @@ bool lyrics_manager_update_track_info(struct lyrics_state *state) {
     return changed;
 }
 
-bool lyrics_manager_load_lyrics(struct lyrics_state *state) {
-    // Cancel ongoing translation and wait for it to finish
-    // This prevents race condition where old and new translation threads
-    // write to the same cache file simultaneously
+// Reset per-track state before loading new lyrics: stop any running translation,
+// free the currently displayed lyrics, and clear the line cursors. After this
+// the live lyrics is empty, so the render loop draws nothing until new lyrics
+// are installed (synchronously below, or by lyrics_manager_poll_load).
+static void reset_for_new_lyrics(struct lyrics_state *state) {
+    // Cancel ongoing translation and wait for it to finish. This prevents a race
+    // where old and new translation threads write to the same cache file.
     cancel_and_wait_translation(&state->playback.lyrics);
 
-    // Free previous lyrics
     lrc_free_data(&state->playback.lyrics);
     state->playback.current_line = NULL;
     state->playback.prev_line = NULL;
@@ -197,41 +201,43 @@ bool lyrics_manager_load_lyrics(struct lyrics_state *state) {
         system_tray_set_overlay_state(true);
         log_info("Overlay auto-enabled for new track");
     }
+}
 
-    // Try to find lyrics
-    if (!lyrics_find_for_track(&state->playback.current_track, &state->playback.lyrics)) {
-        log_info("No lyrics found for current track");
+// Post-processing when no lyrics were found: album art fallback + notification.
+// Runs on the main thread (touches GTK), never on the fetch worker.
+static void finalize_not_found(struct lyrics_state *state) {
+    log_info("No lyrics found for current track");
 
-        // Even without lyrics, try to update album art. Don't gate on
-        // enable_itunes here: cache, MPRIS art, and local embedded-cover
-        // extraction all work offline; try_itunes_artwork self-gates on the
-        // setting for the online step.
-        system_tray_update_icon_with_fallback(
-            state->playback.current_track.art_url,
-            state->playback.current_track.url,
-            state->playback.current_track.artist,
-            state->playback.current_track.album,
-            state->playback.current_track.title
-        );
+    // Even without lyrics, try to update album art. Don't gate on enable_itunes
+    // here: cache, MPRIS art, and local embedded-cover extraction all work
+    // offline; try_itunes_artwork self-gates on the setting for the online step.
+    system_tray_update_icon_with_fallback(
+        state->playback.current_track.art_url,
+        state->playback.current_track.url,
+        state->playback.current_track.artist,
+        state->playback.current_track.album,
+        state->playback.current_track.title
+    );
 
-        // Send notification even without lyrics
-        if (g_config.lyrics.enable_notifications) {
-            char cleaned_title[TITLE_BUFFER_SIZE];
-            lyrics_manager_clean_title(cleaned_title, sizeof(cleaned_title), state->playback.current_track.title);
+    if (g_config.lyrics.enable_notifications) {
+        char cleaned_title[TITLE_BUFFER_SIZE];
+        lyrics_manager_clean_title(cleaned_title, sizeof(cleaned_title), state->playback.current_track.title);
 
-            struct notification_info notif_info = {
-                .title = cleaned_title,
-                .artist = state->playback.current_track.artist,
-                .album = state->playback.current_track.album,
-                .player_name = state->playback.current_track.player_name
-            };
-            system_tray_send_notification(&notif_info);
-        }
-
-        return false;
+        struct notification_info notif_info = {
+            .title = cleaned_title,
+            .artist = state->playback.current_track.artist,
+            .album = state->playback.current_track.album,
+            .player_name = state->playback.current_track.player_name
+        };
+        system_tray_send_notification(&notif_info);
     }
+}
 
-    // Reset translation cancel flag for new lyrics
+// Post-processing when lyrics are installed in the live state: album art,
+// notification, and starting translation. Runs on the main thread against the
+// LIVE lyrics — starting translation here (not inside the provider chain) is
+// what makes the fetch safe to run on a worker thread.
+static void finalize_found(struct lyrics_state *state) {
     state->playback.lyrics.translation_should_cancel = false;
 
     log_info("Loaded %d lines of lyrics", state->playback.lyrics.line_count);
@@ -247,7 +253,6 @@ bool lyrics_manager_load_lyrics(struct lyrics_state *state) {
     const char *album = state->playback.lyrics.metadata.album;
     const char *title = state->playback.lyrics.metadata.title;
 
-    // Fall back to MPRIS metadata if lyrics metadata is not available
     if (!artist || artist[0] == '\0') {
         artist = state->playback.current_track.artist;
     }
@@ -258,14 +263,12 @@ bool lyrics_manager_load_lyrics(struct lyrics_state *state) {
         title = state->playback.current_track.title;
     }
 
-    // Update album art (try MPRIS URL first, then iTunes API)
     log_info("Updating album art with metadata (artist: %s, album: %s, title: %s)",
              artist ? artist : "Unknown", album ? album : "Unknown", title ? title : "Unknown");
     system_tray_update_icon_with_fallback(state->playback.current_track.art_url,
                                           state->playback.current_track.url,
                                           artist, album, title);
 
-    // Send desktop notification after album art is updated
     if (g_config.lyrics.enable_notifications) {
         char cleaned_title[TITLE_BUFFER_SIZE];
         lyrics_manager_clean_title(cleaned_title, sizeof(cleaned_title), title);
@@ -279,7 +282,138 @@ bool lyrics_manager_load_lyrics(struct lyrics_state *state) {
         system_tray_send_notification(&notif_info);
     }
 
+    // Start translation on the live lyrics (was previously started inside the
+    // provider chain; moved out so the fetch can run off the main thread).
+    lyrics_provider_translate(&state->playback.lyrics,
+                              state->playback.current_track.length_us);
+}
+
+// Deep-copy a track snapshot so the fetch worker reads a stable copy that is
+// independent of the live current_track (which the main thread may replace).
+static void copy_track_metadata(struct track_metadata *dst, const struct track_metadata *src) {
+    memset(dst, 0, sizeof(*dst));
+    if (!src) return;
+    dst->title       = src->title       ? strdup(src->title)       : NULL;
+    dst->artist      = src->artist      ? strdup(src->artist)      : NULL;
+    dst->album       = src->album       ? strdup(src->album)       : NULL;
+    dst->url         = src->url         ? strdup(src->url)         : NULL;
+    dst->trackid     = src->trackid     ? strdup(src->trackid)     : NULL;
+    dst->art_url     = src->art_url     ? strdup(src->art_url)     : NULL;
+    dst->player_name = src->player_name ? strdup(src->player_name) : NULL;
+    dst->length_us   = src->length_us;
+    dst->position_us = src->position_us;
+}
+
+// Discard an in-flight (or completed-but-unconsumed) async fetch: ask it to
+// abort, join it, and free its private result and track snapshot.
+void lyrics_manager_cancel_fetch(struct lyrics_state *state) {
+    struct async_lyrics_fetch *fetch = &state->playback.async_fetch;
+    if (!fetch->thread_active) return;
+
+    fetch->should_cancel = true;
+    pthread_join(fetch->thread, NULL);
+    fetch->thread_active = false;
+    fetch->in_progress = false;
+    fetch->ready = false;
+    lrclib_set_cancel_flag(NULL);
+
+    lrc_free_data(&fetch->result);
+    memset(&fetch->result, 0, sizeof(fetch->result));
+    mpris_free_metadata(&fetch->track);
+    memset(&fetch->track, 0, sizeof(fetch->track));
+}
+
+// Fetch worker: runs the (blocking, network) provider search into the fetch's
+// private result buffer. Touches only fetch->result / fetch->track and atomics —
+// never the live lyrics, GTK, or the renderer.
+static void *lyrics_fetch_worker(void *arg) {
+    struct lyrics_state *state = arg;
+    struct async_lyrics_fetch *fetch = &state->playback.async_fetch;
+
+    lrclib_set_cancel_flag(&fetch->should_cancel);
+    fetch->found = lyrics_find_for_track(&fetch->track, &fetch->result);
+    lrclib_set_cancel_flag(NULL);
+
+    fetch->in_progress = false;
+    atomic_store(&fetch->ready, true);
+    return NULL;
+}
+
+// Synchronous load — used by the local-file hot-reload path, where the search
+// hits the fast local provider. Frees old lyrics, searches, and finalizes inline.
+bool lyrics_manager_load_lyrics(struct lyrics_state *state) {
+    lyrics_manager_cancel_fetch(state);   // drop any pending async fetch first
+    reset_for_new_lyrics(state);
+
+    if (!lyrics_find_for_track(&state->playback.current_track, &state->playback.lyrics)) {
+        finalize_not_found(state);
+        return false;
+    }
+    finalize_found(state);
     return true;
+}
+
+// Begin an asynchronous load: reset per-track state (so the overlay clears
+// immediately), snapshot the track, and kick off the fetch worker. Non-blocking;
+// the result is consumed later by lyrics_manager_poll_load.
+void lyrics_manager_begin_load(struct lyrics_state *state) {
+    lyrics_manager_cancel_fetch(state);   // supersede any prior in-flight fetch
+    reset_for_new_lyrics(state);
+
+    struct async_lyrics_fetch *fetch = &state->playback.async_fetch;
+    memset(&fetch->result, 0, sizeof(fetch->result));
+    copy_track_metadata(&fetch->track, &state->playback.current_track);
+    fetch->should_cancel = false;
+    fetch->found = false;
+    fetch->ready = false;
+    fetch->in_progress = true;
+
+    if (pthread_create(&fetch->thread, NULL, lyrics_fetch_worker, state) != 0) {
+        log_warn("Failed to start async lyrics fetch thread; loading synchronously");
+        fetch->in_progress = false;
+        mpris_free_metadata(&fetch->track);
+        memset(&fetch->track, 0, sizeof(fetch->track));
+        if (lyrics_find_for_track(&state->playback.current_track, &state->playback.lyrics)) {
+            finalize_found(state);
+        } else {
+            finalize_not_found(state);
+        }
+        return;
+    }
+    fetch->thread_active = true;
+}
+
+// Consume a completed async fetch (call every main-loop tick). Swaps the fetched
+// result into the live lyrics and runs the main-thread finalize steps. No-op
+// while the worker is still running.
+void lyrics_manager_poll_load(struct lyrics_state *state) {
+    struct async_lyrics_fetch *fetch = &state->playback.async_fetch;
+    if (!fetch->thread_active || !atomic_load(&fetch->ready)) {
+        return;
+    }
+
+    pthread_join(fetch->thread, NULL);
+    fetch->thread_active = false;
+    fetch->ready = false;
+    lrclib_set_cancel_flag(NULL);
+
+    bool found = fetch->found;
+    mpris_free_metadata(&fetch->track);
+    memset(&fetch->track, 0, sizeof(fetch->track));
+
+    if (found) {
+        // reset_for_new_lyrics already freed the live lyrics, so this move-assign
+        // does not leak; zero the source so we never double-free the buffer.
+        state->playback.lyrics = fetch->result;
+        memset(&fetch->result, 0, sizeof(fetch->result));
+        finalize_found(state);
+    } else {
+        lrc_free_data(&fetch->result);
+        memset(&fetch->result, 0, sizeof(fetch->result));
+        finalize_not_found(state);
+    }
+
+    rendering_manager_set_dirty(state);
 }
 
 // Helper: Check if text is empty or whitespace-only

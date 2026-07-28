@@ -31,6 +31,11 @@ extern struct lyrics_provider local_provider;
 // High-level API: Find lyrics for current track
 bool lyrics_find_for_track(struct track_metadata *track, struct lyrics_data *data);
 
+// Start translation of the given lyrics with the configured provider.
+// Call on the LIVE lyrics from the main thread after a fetch is swapped in;
+// lyrics_find_for_track no longer starts translation itself.
+void lyrics_provider_translate(struct lyrics_data *data, int64_t track_length_us);
+
 // Initialize all providers
 void lyrics_providers_init(void);
 

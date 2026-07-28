@@ -23,8 +23,12 @@
 // Translation helper
 // ============================================================================
 
-// Translate lyrics using the configured translation provider
-static void translate_lyrics_with_provider(struct lyrics_data *data, int64_t track_length_us) {
+// Translate lyrics using the configured translation provider.
+// Exposed so the caller can start translation on the LIVE lyrics AFTER an async
+// fetch has been swapped in — starting it inside the provider chain would bind
+// the translation thread to the worker-private result buffer, which is then
+// moved, causing a use-after-free / double-free.
+void lyrics_provider_translate(struct lyrics_data *data, int64_t track_length_us) {
     if (!data || !g_config.translation.provider) {
         return;
     }
@@ -693,8 +697,10 @@ static bool try_load_from_cache(const char *metadata_hash, struct lyrics_data *d
         data->md5_checksum[0] = '\0';
     }
 
-    // Try to translate lyrics with configured provider
-    translate_lyrics_with_provider(data, track_length_us);
+    // Translation is started by the caller on the live lyrics after this returns
+    // (see lyrics_provider_translate) — never here, so it is safe to run this
+    // path on the async fetch worker thread.
+    (void)track_length_us;
 
     return true;
 }
@@ -780,8 +786,8 @@ static bool try_providers(const struct track_metadata *track, struct lyrics_data
             cache_lrclib_lyrics(track, data, metadata_hash);
         }
 
-        // Try to translate lyrics with configured provider
-        translate_lyrics_with_provider(data, track->length_us);
+        // Translation is started by the caller on the live lyrics after the
+        // (possibly off-thread) fetch completes — see lyrics_provider_translate.
 
         return true;
     }

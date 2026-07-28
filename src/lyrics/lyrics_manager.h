@@ -33,13 +33,41 @@ void lyrics_manager_clean_title(char *dest, size_t dest_size, const char *title)
 bool lyrics_manager_update_track_info(struct lyrics_state *state);
 
 /**
- * Load lyrics for current track
- * Searches local files and online sources
+ * Load lyrics for current track synchronously
+ * Searches local files and online sources, blocking until done. Used by the
+ * local-file hot-reload path; track changes use the async begin/poll pair below.
  *
  * @param state Lyrics state
  * @return true if lyrics loaded, false if not found
  */
 bool lyrics_manager_load_lyrics(struct lyrics_state *state);
+
+/**
+ * Begin an asynchronous lyrics load for the current track.
+ * Clears the current lyrics immediately and runs the (blocking, network) search
+ * on a worker thread. Non-blocking; call lyrics_manager_poll_load each tick to
+ * install the result once ready.
+ *
+ * @param state Lyrics state
+ */
+void lyrics_manager_begin_load(struct lyrics_state *state);
+
+/**
+ * Consume a completed asynchronous lyrics load, if any.
+ * Swaps the fetched lyrics into the live state and runs album-art/notification/
+ * translation finalization on the main thread. No-op while the fetch is running.
+ *
+ * @param state Lyrics state
+ */
+void lyrics_manager_poll_load(struct lyrics_state *state);
+
+/**
+ * Cancel and discard any in-flight or unconsumed async lyrics fetch.
+ * Call on track change (implicitly done by begin_load) and at shutdown.
+ *
+ * @param state Lyrics state
+ */
+void lyrics_manager_cancel_fetch(struct lyrics_state *state);
 
 /**
  * Update current line based on playback position
