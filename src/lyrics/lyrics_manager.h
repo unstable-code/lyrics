@@ -70,6 +70,23 @@ void lyrics_manager_poll_load(struct lyrics_state *state);
 void lyrics_manager_cancel_fetch(struct lyrics_state *state);
 
 /**
+ * Consume a completed asynchronous artwork (iTunes) fetch, if any.
+ * Applies the resolved tray icon and sends the deferred track notification on
+ * the main thread. No-op while the artwork worker is running.
+ *
+ * @param state Lyrics state
+ */
+void lyrics_manager_poll_art(struct lyrics_state *state);
+
+/**
+ * Cancel and discard any in-flight or unconsumed async artwork fetch.
+ * Call on track change (implicitly done by begin_load) and at shutdown.
+ *
+ * @param state Lyrics state
+ */
+void lyrics_manager_cancel_art_fetch(struct lyrics_state *state);
+
+/**
  * Update current line based on playback position
  * Updates current_line, prev_line, next_line pointers
  *

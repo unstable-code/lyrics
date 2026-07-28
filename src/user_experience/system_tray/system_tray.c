@@ -23,6 +23,7 @@
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <curl/curl.h>
 #include <cairo/cairo.h>
+#include <stdatomic.h>
 
 // State
 static AppIndicator *indicator = NULL;
@@ -105,6 +106,22 @@ static size_t artwork_write_capped(void *contents, size_t size, size_t nmemb, vo
     return curl_write_to_memory(contents, size, nmemb, userp);
 }
 
+// Cooperative cancellation for the async artwork worker (iTunes image download).
+// The worker points this at its should_cancel flag; the curl progress callback
+// aborts the transfer when set, so a track skip need not wait out the timeout.
+static _Atomic(_Atomic bool *) g_art_cancel_flag = NULL;
+
+void system_tray_set_art_cancel_flag(_Atomic bool *flag) {
+    atomic_store(&g_art_cancel_flag, flag);
+}
+
+static int art_download_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                                    curl_off_t ultotal, curl_off_t ulnow) {
+    (void)clientp; (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    _Atomic bool *flag = atomic_load(&g_art_cancel_flag);
+    return (flag && atomic_load(flag)) ? 1 : 0;
+}
+
 // Download image from URL to memory
 static bool download_image(const char *url, struct curl_memory_buffer *buffer) {
     CURL *curl = curl_easy_init();
@@ -128,7 +145,9 @@ static bool download_image(const char *url, struct curl_memory_buffer *buffer) {
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L) != CURLE_OK ||
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L) != CURLE_OK ||
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK) {
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, art_download_progress_cb) != CURLE_OK ||
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L) != CURLE_OK) {
         log_error("system_tray: Failed to set CURL options");
         curl_memory_buffer_free(buffer);
         curl_easy_cleanup(curl);
@@ -642,6 +661,50 @@ bool system_tray_init(void) {
     return true;
 }
 
+// Render an image URL (http/https or file://) to a PNG at out_path with the
+// standard 48x48 + circular-mask processing. Pure download/decode/pixbuf/save
+// with NO AppIndicator calls, so it is safe to run on a worker thread. The
+// caller must ensure out_path's directory exists.
+bool system_tray_render_art_to_cache(const char *art_url, const char *out_path) {
+    if (!art_url || !out_path) {
+        return false;
+    }
+
+    GdkPixbuf *pixbuf = load_image_from_url(art_url);
+    if (!pixbuf) {
+        return false;
+    }
+
+    // Scale to reasonable size (48x48)
+    GdkPixbuf *scaled = gdk_pixbuf_scale_simple(pixbuf, 48, 48, GDK_INTERP_BILINEAR);
+    g_object_unref(pixbuf);
+    if (!scaled) {
+        return false;
+    }
+
+    // Apply circular mask (CD-like appearance)
+    GdkPixbuf *rounded = apply_circular_mask(scaled);
+    g_object_unref(scaled);
+    if (!rounded) {
+        log_error("Failed to apply circular mask");
+        return false;
+    }
+
+    // Save as PNG (owner-only access for privacy)
+    GError *error = NULL;
+    mode_t old_mask = umask(0077);
+    bool save_result = gdk_pixbuf_save(rounded, out_path, "png", &error, NULL);
+    umask(old_mask);
+    g_object_unref(rounded);
+    if (!save_result) {
+        log_error("Failed to save icon: %s", error ? error->message : "unknown");
+        if (error) g_error_free(error);
+        return false;
+    }
+
+    return true;
+}
+
 bool system_tray_update_icon(const char *art_url) {
     if (!indicator || !art_url) {
         log_error("update_icon: indicator=%p, art_url=%p", (void*)indicator, (void*)art_url);
@@ -656,50 +719,17 @@ bool system_tray_update_icon(const char *art_url) {
         return true;
     }
 
-    // Load image from URL
-    log_info("Loading image from URL...");
-    GdkPixbuf *pixbuf = load_image_from_url(art_url);
-
-    if (!pixbuf) {
-        // Fallback to default icon
-        log_warn("Failed to load image, using default icon");
-        app_indicator_set_icon(indicator, "audio-player");
-        return false;
-    }
-
-    log_info("Image loaded successfully");
-
     // Create directory if it doesn't exist
     if (mkdir(g_icon_dir, 0700) != 0 && errno != EEXIST) {
         log_warn("Failed to create icon directory: %s", strerror(errno));
     }
 
-    // Scale to reasonable size (48x48)
-    GdkPixbuf *scaled = gdk_pixbuf_scale_simple(pixbuf, 48, 48, GDK_INTERP_BILINEAR);
-    g_object_unref(pixbuf);
-
-    // Apply circular mask (CD-like appearance)
-    GdkPixbuf *rounded = apply_circular_mask(scaled);
-    g_object_unref(scaled);
-
-    if (!rounded) {
-        log_error("Failed to apply circular mask");
+    if (!system_tray_render_art_to_cache(art_url, g_icon_path)) {
+        // Fallback to default icon
+        log_warn("Failed to load image, using default icon");
+        app_indicator_set_icon(indicator, "audio-player");
         return false;
     }
-
-    // Save as PNG (overwrites previous, owner-only access for privacy)
-    GError *error = NULL;
-    mode_t old_mask = umask(0077);
-    bool save_result = gdk_pixbuf_save(rounded, g_icon_path, "png", &error, NULL);
-    umask(old_mask);
-    if (!save_result) {
-        log_error("Failed to save icon: %s", error->message);
-        g_error_free(error);
-        g_object_unref(rounded);
-        return false;
-    }
-
-    g_object_unref(rounded);
 
     log_info("Album art saved to: %s", g_icon_path);
 
@@ -1188,38 +1218,62 @@ static bool try_local_video_thumbnail(const char *file_url, const char *cache_pa
     return success;
 }
 
-// Try to get artwork from iTunes API
-static bool try_itunes_artwork(const char *artist, const char *album, const char *track,
-                               const char *cache_path, const char *metadata_hash) {
-    if (!g_config.lyrics.enable_itunes || !track || track[0] == '\0') {
-        if (!g_config.lyrics.enable_itunes) {
-            log_info("iTunes API disabled in config");
-        }
+// Worker-safe: resolve iTunes artwork for the track into out_path ({md5}.png).
+// Blocking network (iTunes search + image download) with no AppIndicator calls,
+// so it runs on the artwork worker thread. Honors the artwork cancel flag.
+bool system_tray_resolve_itunes_art(const char *artist, const char *album,
+                                    const char *track, const char *out_path) {
+    if (!track || track[0] == '\0' || !out_path) {
         return false;
     }
 
     log_info("Trying iTunes Search API...");
     char *itunes_url = itunes_search_artwork(artist, album, track);
-
-    if (itunes_url) {
-        bool success = system_tray_update_icon(itunes_url);
-        free(itunes_url);
-
-        // Cache iTunes artwork if successful
-        if (success && metadata_hash[0] != '\0') {
-            cache_current_artwork(cache_path);
-            snprintf(last_metadata_hash, sizeof(last_metadata_hash), "%s", metadata_hash);
-        }
-
-        return success;
-    } else {
+    if (!itunes_url) {
         log_info("iTunes Search API did not return artwork");
+        return false;
     }
 
-    return false;
+    bool ok = system_tray_render_art_to_cache(itunes_url, out_path);
+    free(itunes_url);
+    return ok;
 }
 
-bool system_tray_update_icon_with_fallback(const char *art_url, const char *file_url, const char *artist, const char *album, const char *track) {
+// Main-thread: point the tray at a resolved cache PNG and record it as current.
+void system_tray_apply_cached_icon(const char *metadata_hash) {
+    if (!set_indicator_icon_cached(metadata_hash)) {
+        return;
+    }
+    snprintf(last_metadata_hash, sizeof(last_metadata_hash), "%s", metadata_hash);
+
+    // Mirror the applied art into the shared scratch PNG (album-art.png) so the
+    // desktop-notification badge — which is built from g_icon_path — shows the
+    // same image. set_indicator_icon_cached only points the tray at {md5}.png;
+    // the fast local sources already write g_icon_path, but the async iTunes
+    // worker wrote only the cache file, leaving the notification icon blank.
+    char cache_path[512];
+    if (build_album_art_cache_path(cache_path, sizeof(cache_path), metadata_hash) <= 0) {
+        return;
+    }
+    GError *error = NULL;
+    GdkPixbuf *art = gdk_pixbuf_new_from_file(cache_path, &error);
+    if (!art) {
+        if (error) g_error_free(error);
+        return;
+    }
+    mode_t old_mask = umask(0077);
+    gdk_pixbuf_save(art, g_icon_path, "png", NULL, NULL);
+    umask(old_mask);
+    g_object_unref(art);
+}
+
+enum tray_art_status system_tray_update_icon_fast(const char *art_url, const char *file_url,
+                                                  const char *artist, const char *album,
+                                                  const char *track, char *md5_out, size_t md5_sz,
+                                                  char *cache_out, size_t cache_sz) {
+    if (md5_out && md5_sz) md5_out[0] = '\0';
+    if (cache_out && cache_sz) cache_out[0] = '\0';
+
     // Calculate metadata hash for caching (using artist + track + album)
     char metadata_hash[MD5_DIGEST_STRING_LENGTH];
     if (!calculate_metadata_md5(artist, track, album, metadata_hash)) {
@@ -1230,40 +1284,45 @@ bool system_tray_update_icon_with_fallback(const char *art_url, const char *file
     // Check if we already loaded this artwork (same metadata hash)
     if (metadata_hash[0] != '\0' && strcmp(last_metadata_hash, metadata_hash) == 0) {
         log_info("Same metadata hash, skipping artwork update");
-        return true;
+        return TRAY_ART_APPLIED;
     }
 
-    // Ensure cache directories exist
     ensure_cache_directories();
 
-    // Build cache path
     char cache_path[512];
     if (metadata_hash[0] == '\0' || build_album_art_cache_path(cache_path, sizeof(cache_path), metadata_hash) <= 0) {
         cache_path[0] = '\0';  // No cache path available
     }
 
-    // Try sources in priority order — local cache (fastest, no network) →
-    // MPRIS art URL → local file embedded cover → local video thumbnail →
-    // iTunes API. The first hit leaves the artwork cached, so a single call
-    // sets the tray icon from that cache. Short-circuiting || preserves the
-    // sequential-fallback semantics. The two ffmpeg-based local steps sit
-    // before iTunes so a local track whose player omits mpris:artUrl still
-    // resolves offline: an embedded cover if the file has one, otherwise a
-    // centre-cropped frame for video files.
+    // Try only the FAST sources (no network) in priority order — local cache →
+    // MPRIS art URL → local file embedded cover → local video thumbnail. The two
+    // ffmpeg-based local steps still resolve offline for local tracks whose
+    // player omits mpris:artUrl. iTunes (network) is deferred to a worker below.
     if ((cache_path[0] != '\0' && load_cached_album_art(cache_path, metadata_hash)) ||
         try_mpris_artwork(art_url, cache_path, metadata_hash) ||
         try_local_embedded_artwork(file_url, cache_path, metadata_hash) ||
-        try_local_video_thumbnail(file_url, cache_path, metadata_hash) ||
-        try_itunes_artwork(artist, album, track, cache_path, metadata_hash)) {
+        try_local_video_thumbnail(file_url, cache_path, metadata_hash)) {
         set_indicator_icon_cached(metadata_hash);
-        return true;
+        return TRAY_ART_APPLIED;
     }
 
-    // No artwork available - reset to default icon
+    // Fast sources missed. If iTunes is enabled, hand the deterministic md5/cache
+    // path back so the caller can resolve it off the main thread. Leave the
+    // current icon and last_metadata_hash untouched until the worker lands.
+    if (g_config.lyrics.enable_itunes && track && track[0] != '\0' &&
+        metadata_hash[0] != '\0' && cache_path[0] != '\0') {
+        if (md5_out) snprintf(md5_out, md5_sz, "%s", metadata_hash);
+        if (cache_out) snprintf(cache_out, cache_sz, "%s", cache_path);
+        return TRAY_ART_NEED_ITUNES;
+    }
+
+    // No artwork available and no online source - reset to default icon
+    if (!g_config.lyrics.enable_itunes) {
+        log_info("iTunes API disabled in config");
+    }
     log_info("No artwork available from any source, using default icon");
     system_tray_reset_icon();
-    last_metadata_hash[0] = '\0';
-    return false;
+    return TRAY_ART_NONE;
 }
 
 void system_tray_update(void) {

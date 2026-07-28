@@ -5,6 +5,7 @@
 #include "../utils/mpris/mpris.h"
 #include "../provider/lyrics/lyrics_provider.h"
 #include "../provider/lrclib/lrclib_provider.h"
+#include "../provider/itunes/itunes_artwork.h"
 #include "../user_experience/system_tray/system_tray.h"
 #include "../parser/lrc/lrc_common.h"
 #include "../utils/file/file_utils.h"
@@ -203,34 +204,117 @@ static void reset_for_new_lyrics(struct lyrics_state *state) {
     }
 }
 
-// Post-processing when no lyrics were found: album art fallback + notification.
+// --- Async album-art (iTunes) offload ------------------------------------
+
+// Free the artwork worker's owned input / deferred-notification strings.
+static void free_art_fetch_inputs(struct async_art_fetch *af) {
+    free(af->artist); free(af->album); free(af->track);
+    af->artist = af->album = af->track = NULL;
+    free(af->notif_title); free(af->notif_artist);
+    free(af->notif_album); free(af->notif_player);
+    af->notif_title = af->notif_artist = af->notif_album = af->notif_player = NULL;
+    af->notify_pending = false;
+}
+
+// Send the track-change desktop notification (main thread).
+static void send_track_notification(struct lyrics_state *state, const char *artist,
+                                    const char *album, const char *title) {
+    if (!g_config.lyrics.enable_notifications) {
+        return;
+    }
+    char cleaned_title[TITLE_BUFFER_SIZE];
+    lyrics_manager_clean_title(cleaned_title, sizeof(cleaned_title), title);
+    struct notification_info notif_info = {
+        .title = cleaned_title,
+        .artist = artist,
+        .album = album,
+        .player_name = state->playback.current_track.player_name
+    };
+    system_tray_send_notification(&notif_info);
+}
+
+// Artwork worker: resolve iTunes art into the cache PNG. Touches only the
+// async_art buffers and the network — never GTK/AppIndicator or live state.
+static void *art_fetch_worker(void *arg) {
+    struct lyrics_state *state = arg;
+    struct async_art_fetch *af = &state->playback.async_art;
+
+    itunes_set_cancel_flag(&af->should_cancel);
+    system_tray_set_art_cancel_flag(&af->should_cancel);
+    af->found = system_tray_resolve_itunes_art(af->artist, af->album, af->track, af->cache_path);
+    itunes_set_cancel_flag(NULL);
+    system_tray_set_art_cancel_flag(NULL);
+
+    atomic_store(&af->ready, true);
+    return NULL;
+}
+
+// Start the iTunes artwork worker for the current track. The track notification
+// is captured and deferred until the art lands (or fails) — see poll_art.
+static void begin_art_fetch(struct lyrics_state *state, const char *artist,
+                            const char *album, const char *title,
+                            const char *md5, const char *cache_path) {
+    struct async_art_fetch *af = &state->playback.async_art;
+    snprintf(af->md5, sizeof(af->md5), "%s", md5);
+    snprintf(af->cache_path, sizeof(af->cache_path), "%s", cache_path);
+    af->artist = artist ? strdup(artist) : NULL;
+    af->album  = album  ? strdup(album)  : NULL;
+    af->track  = title  ? strdup(title)  : NULL;
+
+    af->notify_pending = g_config.lyrics.enable_notifications;
+    if (af->notify_pending) {
+        char cleaned_title[TITLE_BUFFER_SIZE];
+        lyrics_manager_clean_title(cleaned_title, sizeof(cleaned_title), title);
+        af->notif_title  = strdup(cleaned_title);
+        af->notif_artist = artist ? strdup(artist) : NULL;
+        af->notif_album  = album  ? strdup(album)  : NULL;
+        af->notif_player = state->playback.current_track.player_name
+                               ? strdup(state->playback.current_track.player_name) : NULL;
+    }
+
+    af->should_cancel = false;
+    af->found = false;
+    af->ready = false;
+    if (pthread_create(&af->thread, NULL, art_fetch_worker, state) != 0) {
+        log_warn("Failed to start artwork worker; skipping iTunes art");
+        free_art_fetch_inputs(af);
+        send_track_notification(state, artist, album, title);  // deferred notif fires now
+        return;
+    }
+    af->thread_active = true;
+}
+
+// Resolve album art via the fast (non-network) sources on the main thread, then
+// either send the track notification now, or — when only iTunes can supply it —
+// start the artwork worker and defer the notification until the art resolves.
+static void finalize_common(struct lyrics_state *state, const char *art_url,
+                            const char *file_url, const char *artist,
+                            const char *album, const char *title) {
+    lyrics_manager_cancel_art_fetch(state);   // supersede any prior art fetch
+
+    char md5[MD5_DIGEST_STRING_LENGTH];
+    char cache_path[512];
+    enum tray_art_status st = system_tray_update_icon_fast(
+        art_url, file_url, artist, album, title,
+        md5, sizeof(md5), cache_path, sizeof(cache_path));
+
+    if (st == TRAY_ART_NEED_ITUNES) {
+        begin_art_fetch(state, artist, album, title, md5, cache_path);
+        return;   // notification is sent once the art lands (poll_art)
+    }
+    send_track_notification(state, artist, album, title);
+}
+
+// Post-processing when no lyrics were found: album art + notification.
 // Runs on the main thread (touches GTK), never on the fetch worker.
 static void finalize_not_found(struct lyrics_state *state) {
     log_info("No lyrics found for current track");
-
-    // Even without lyrics, try to update album art. Don't gate on enable_itunes
-    // here: cache, MPRIS art, and local embedded-cover extraction all work
-    // offline; try_itunes_artwork self-gates on the setting for the online step.
-    system_tray_update_icon_with_fallback(
-        state->playback.current_track.art_url,
-        state->playback.current_track.url,
-        state->playback.current_track.artist,
-        state->playback.current_track.album,
-        state->playback.current_track.title
-    );
-
-    if (g_config.lyrics.enable_notifications) {
-        char cleaned_title[TITLE_BUFFER_SIZE];
-        lyrics_manager_clean_title(cleaned_title, sizeof(cleaned_title), state->playback.current_track.title);
-
-        struct notification_info notif_info = {
-            .title = cleaned_title,
-            .artist = state->playback.current_track.artist,
-            .album = state->playback.current_track.album,
-            .player_name = state->playback.current_track.player_name
-        };
-        system_tray_send_notification(&notif_info);
-    }
+    finalize_common(state,
+                    state->playback.current_track.art_url,
+                    state->playback.current_track.url,
+                    state->playback.current_track.artist,
+                    state->playback.current_track.album,
+                    state->playback.current_track.title);
 }
 
 // Post-processing when lyrics are installed in the live state: album art,
@@ -265,22 +349,8 @@ static void finalize_found(struct lyrics_state *state) {
 
     log_info("Updating album art with metadata (artist: %s, album: %s, title: %s)",
              artist ? artist : "Unknown", album ? album : "Unknown", title ? title : "Unknown");
-    system_tray_update_icon_with_fallback(state->playback.current_track.art_url,
-                                          state->playback.current_track.url,
-                                          artist, album, title);
-
-    if (g_config.lyrics.enable_notifications) {
-        char cleaned_title[TITLE_BUFFER_SIZE];
-        lyrics_manager_clean_title(cleaned_title, sizeof(cleaned_title), title);
-
-        struct notification_info notif_info = {
-            .title = cleaned_title,
-            .artist = artist,
-            .album = album,
-            .player_name = state->playback.current_track.player_name
-        };
-        system_tray_send_notification(&notif_info);
-    }
+    finalize_common(state, state->playback.current_track.art_url,
+                    state->playback.current_track.url, artist, album, title);
 
     // Start translation on the live lyrics (was previously started inside the
     // provider chain; moved out so the fetch can run off the main thread).
@@ -357,7 +427,8 @@ bool lyrics_manager_load_lyrics(struct lyrics_state *state) {
 // immediately), snapshot the track, and kick off the fetch worker. Non-blocking;
 // the result is consumed later by lyrics_manager_poll_load.
 void lyrics_manager_begin_load(struct lyrics_state *state) {
-    lyrics_manager_cancel_fetch(state);   // supersede any prior in-flight fetch
+    lyrics_manager_cancel_fetch(state);       // supersede any prior in-flight fetch
+    lyrics_manager_cancel_art_fetch(state);   // and the previous track's artwork fetch
     reset_for_new_lyrics(state);
 
     struct async_lyrics_fetch *fetch = &state->playback.async_fetch;
@@ -414,6 +485,54 @@ void lyrics_manager_poll_load(struct lyrics_state *state) {
     }
 
     rendering_manager_set_dirty(state);
+}
+
+// Discard an in-flight (or unconsumed) artwork fetch: abort, join, free inputs.
+void lyrics_manager_cancel_art_fetch(struct lyrics_state *state) {
+    struct async_art_fetch *af = &state->playback.async_art;
+    if (!af->thread_active) return;
+
+    af->should_cancel = true;
+    pthread_join(af->thread, NULL);
+    af->thread_active = false;
+    af->ready = false;
+    itunes_set_cancel_flag(NULL);
+    system_tray_set_art_cancel_flag(NULL);
+    free_art_fetch_inputs(af);
+}
+
+// Consume a completed artwork fetch (call every main-loop tick). Applies the
+// resolved icon on the main thread and sends the deferred track notification.
+void lyrics_manager_poll_art(struct lyrics_state *state) {
+    struct async_art_fetch *af = &state->playback.async_art;
+    if (!af->thread_active || !atomic_load(&af->ready)) {
+        return;
+    }
+
+    pthread_join(af->thread, NULL);
+    af->thread_active = false;
+    af->ready = false;
+    itunes_set_cancel_flag(NULL);
+    system_tray_set_art_cancel_flag(NULL);
+
+    if (af->found) {
+        system_tray_apply_cached_icon(af->md5);
+    } else {
+        // iTunes had nothing either — fall back to the default icon.
+        system_tray_reset_icon();
+    }
+
+    if (af->notify_pending) {
+        struct notification_info notif_info = {
+            .title = af->notif_title,
+            .artist = af->notif_artist,
+            .album = af->notif_album,
+            .player_name = af->notif_player,
+        };
+        system_tray_send_notification(&notif_info);
+    }
+
+    free_art_fetch_inputs(af);
 }
 
 // Helper: Check if text is empty or whitespace-only

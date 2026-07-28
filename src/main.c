@@ -334,6 +334,8 @@ static void monitor_track_and_files(struct lyrics_state *state, int *update_coun
 
     // Install a completed async fetch (this or a previous tick's).
     lyrics_manager_poll_load(state);
+    // Apply a completed async artwork fetch (iTunes) and its deferred notification.
+    lyrics_manager_poll_art(state);
 
     // Check if lyrics or config files have changed (every 2 seconds).
     // Skip while an async fetch is running: the worker reads g_config in the
@@ -501,6 +503,7 @@ static void cleanup_resources(struct lyrics_state *state, char *font_from_config
 
     dbus_control_cleanup();
     system_tray_cleanup();
+    lyrics_manager_cancel_art_fetch(state);
     lyrics_manager_cancel_fetch(state);
     cancel_and_wait_translation(&state->playback.lyrics);
     lrc_free_data(&state->playback.lyrics);
