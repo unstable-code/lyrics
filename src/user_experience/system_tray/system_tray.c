@@ -1262,7 +1262,14 @@ void system_tray_apply_cached_icon(const char *metadata_hash) {
         return;
     }
     mode_t old_mask = umask(0077);
-    gdk_pixbuf_save(art, g_icon_path, "png", NULL, NULL);
+    // error is NULL here (the load above succeeded); reuse it for the save.
+    // A failed mirror is non-fatal — the tray icon is already set above; this
+    // only keeps the notification badge in sync — so warn and continue.
+    if (!gdk_pixbuf_save(art, g_icon_path, "png", &error, NULL)) {
+        log_warn("system_tray: failed to mirror art to notification icon: %s",
+                 error ? error->message : "unknown error");
+        if (error) g_error_free(error);
+    }
     umask(old_mask);
     g_object_unref(art);
 }
