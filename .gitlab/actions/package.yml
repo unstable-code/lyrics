@@ -279,8 +279,6 @@
 
 package:deb:amd64:
   extends: .package:deb
-  tags:
-    - saas-linux-small-amd64
   variables:
     DEB_ARCH: amd64
 
@@ -293,8 +291,6 @@ package:deb:arm64:
 
 package:rpm:x86_64:
   extends: .package:rpm
-  tags:
-    - saas-linux-small-amd64
   variables:
     RPM_ARCH: x86_64
 
@@ -307,8 +303,6 @@ package:rpm:aarch64:
 
 package:appimage:x86_64:
   extends: .package:appimage
-  tags:
-    - saas-linux-small-amd64
   variables:
     APPIMAGE_ARCH: x86_64
 

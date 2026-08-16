@@ -100,7 +100,9 @@ publish:github-release:
 
 publish:nur-unstable:
   stage: publish
-  image: nixos/nix:latest
+  # Runs on the NixOS shell-executor runner: nix is native, no container image
+  tags:
+    - nix-build
   extends: .nontag-master-rules
   needs:
     - job: build:makepkg
@@ -113,9 +115,6 @@ publish:nur-unstable:
     - COMMIT_HASH="$CI_COMMIT_SHA"
     - COMMIT_DATE=$(echo "$CI_COMMIT_TIMESTAMP" | cut -d'T' -f1)
 
-    # Install tools missing from nixos/nix image
-    - nix-env -iA nixpkgs.gnused nixpkgs.findutils
-
     # Calculate Nix hash, update unstable.nix, commit and push
     - |
       HASH_BASE32=$(nix-prefetch-url --unpack \
@@ -123,6 +122,8 @@ publish:nur-unstable:
       HASH_SRI=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$HASH_BASE32")
       echo "Nix SRI hash: ${HASH_SRI}"
 
+      # Shell executor reuses the build directory — clear any leftover clone
+      rm -rf nur-packages
       git clone "https://oauth2:${NUR_PAT}@github.com/unstable-code/nur-packages.git" nur-packages
       cd nur-packages/pkgs/wshowlyrics
       # Hash above is computed from the GitHub mirror — the fetcher must match it
@@ -143,14 +144,15 @@ publish:nur-unstable:
 
 publish:nur-stable:
   stage: publish
-  image: nixos/nix:latest
+  # Runs on the NixOS shell-executor runner: nix is native, no container image
+  tags:
+    - nix-build
   extends: .tag-only-rules
   needs:
     - job: build:makepkg
     - job: build:fuzz
   script:
     - VERSION="${CI_COMMIT_TAG#v}"
-    - nix-env -iA nixpkgs.gnused nixpkgs.findutils
 
     # Calculate Nix hash, update default.nix, commit and push
     - |
@@ -159,6 +161,8 @@ publish:nur-stable:
       HASH_SRI=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$HASH_BASE32")
       echo "Nix SRI hash: ${HASH_SRI}"
 
+      # Shell executor reuses the build directory — clear any leftover clone
+      rm -rf nur-packages
       git clone "https://oauth2:${NUR_PAT}@github.com/unstable-code/nur-packages.git" nur-packages
       cd nur-packages/pkgs/wshowlyrics
       # Hash above is computed from the GitHub mirror — the fetcher must match it
@@ -196,6 +200,9 @@ publish:copr-nightly:
       mkdir -p ~/.config
       echo "$COPR_CONFIG" | base64 -d > ~/.config/copr
       chmod 600 ~/.config/copr
+
+    # The checkout is owned by a different uid than the job user
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
 
     # Package version
     - |
@@ -452,7 +459,12 @@ publish:aur-git:
   variables:
     GIT_DEPTH: 0
   script:
+    # The runner kernel rejects pacman's seccomp sandbox — same guard as build:makepkg
+    - sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
     - pacman -Syu --noconfirm base-devel git openssh sudo
+
+    # The checkout is owned by a different uid than the job user
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
 
     # Package version
     - VER=$(printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)")
@@ -493,6 +505,8 @@ publish:aur-stable:
     - job: build:fuzz
   script:
     - VERSION="${CI_COMMIT_TAG#v}"
+    # The runner kernel rejects pacman's seccomp sandbox — same guard as build:makepkg
+    - sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
     - pacman -Syu --noconfirm base-devel git openssh sudo pacman-contrib
 
     # Setup SSH for AUR
