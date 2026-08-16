@@ -119,12 +119,14 @@ publish:nur-unstable:
     # Calculate Nix hash, update unstable.nix, commit and push
     - |
       HASH_BASE32=$(nix-prefetch-url --unpack \
-        "https://gitlab.com/wshowlyrics/wshowlyrics/-/archive/${COMMIT_HASH}/wshowlyrics-${COMMIT_HASH}.tar.gz" 2>&1 | tail -1)
+        "https://github.com/wshowlyrics/wshowlyrics/archive/${COMMIT_HASH}.tar.gz" 2>&1 | tail -1)
       HASH_SRI=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$HASH_BASE32")
       echo "Nix SRI hash: ${HASH_SRI}"
 
       git clone "https://oauth2:${NUR_PAT}@github.com/unstable-code/nur-packages.git" nur-packages
       cd nur-packages/pkgs/wshowlyrics
+      # Hash above is computed from the GitHub mirror — the fetcher must match it
+      sed -i "s|fetchFromGitLab|fetchFromGitHub|g" unstable.nix
       sed -i "s|version = \"[^\"]*\";|version = \"${COMMIT_DATE}\";|" unstable.nix
       sed -i "s|rev = \"[^\"]*\";|rev = \"${COMMIT_HASH}\";|" unstable.nix
       sed -i "s|hash = \"[^\"]*\";|hash = \"${HASH_SRI}\";|" unstable.nix
@@ -153,12 +155,14 @@ publish:nur-stable:
     # Calculate Nix hash, update default.nix, commit and push
     - |
       HASH_BASE32=$(nix-prefetch-url --unpack \
-        "https://gitlab.com/wshowlyrics/wshowlyrics/-/archive/${CI_COMMIT_TAG}/wshowlyrics-${CI_COMMIT_TAG}.tar.gz" 2>&1 | tail -1)
+        "https://github.com/wshowlyrics/wshowlyrics/archive/${CI_COMMIT_TAG}.tar.gz" 2>&1 | tail -1)
       HASH_SRI=$(nix --extra-experimental-features nix-command hash convert --hash-algo sha256 --to sri "$HASH_BASE32")
       echo "Nix SRI hash: ${HASH_SRI}"
 
       git clone "https://oauth2:${NUR_PAT}@github.com/unstable-code/nur-packages.git" nur-packages
       cd nur-packages/pkgs/wshowlyrics
+      # Hash above is computed from the GitHub mirror — the fetcher must match it
+      sed -i "s|fetchFromGitLab|fetchFromGitHub|g" default.nix
       sed -i "s|version = \"[^\"]*\";|version = \"${VERSION}\";|" default.nix
       sed -i "s|rev = \"[^\"]*\";|rev = \"${CI_COMMIT_TAG}\";|" default.nix
       sed -i "s|hash = \"[^\"]*\";|hash = \"${HASH_SRI}\";|" default.nix
@@ -340,7 +344,7 @@ publish:copr-stable:
 
       License:        GPL-3.0-or-later
       URL:            https://github.com/wshowlyrics/wshowlyrics
-      Source0:        https://gitlab.com/wshowlyrics/wshowlyrics/-/archive/v${VERSION}/wshowlyrics-v${VERSION}.tar.gz
+      Source0:        https://github.com/wshowlyrics/wshowlyrics/archive/refs/tags/v${VERSION}.tar.gz#/wshowlyrics-${VERSION}.tar.gz
 
       BuildRequires:  meson >= 0.48.0
       BuildRequires:  ninja-build
@@ -383,7 +387,7 @@ publish:copr-stable:
       - System tray integration with album art
 
       %prep
-      %autosetup -n wshowlyrics-v${VERSION}
+      %autosetup -n wshowlyrics-${VERSION}
 
       %build
       %meson
@@ -414,13 +418,14 @@ publish:copr-stable:
       - Release ${VERSION}
       SPECEOF
 
-    # Download source tarball from GitLab
-    - wget "https://gitlab.com/wshowlyrics/wshowlyrics/-/archive/v${VERSION}/wshowlyrics-v${VERSION}.tar.gz"
+    # Download source tarball from the GitHub mirror
+    # -O matches the Source0 "#/" fragment, so rpmbuild finds the expected filename
+    - wget -O "wshowlyrics-${VERSION}.tar.gz" "https://github.com/wshowlyrics/wshowlyrics/archive/refs/tags/v${VERSION}.tar.gz"
 
     # Build SRPM
     - |
       mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-      cp "wshowlyrics-v${VERSION}.tar.gz" ~/rpmbuild/SOURCES/
+      cp "wshowlyrics-${VERSION}.tar.gz" ~/rpmbuild/SOURCES/
       cp wshowlyrics.spec ~/rpmbuild/SPECS/
       rpmbuild -bs ~/rpmbuild/SPECS/wshowlyrics.spec
 
