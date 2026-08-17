@@ -43,6 +43,47 @@ Fuzz sources are in `fuzz/`, seed corpora in `fuzz/corpus/{lrc,lrcx,srt,url_deco
 - **GitHub Actions** (`.github/workflows/coverity-scan.yml`) runs Coverity Scan only — Coverity is GitHub-only.
 - Pipeline rules trigger on: `RUN_ALL=true`, version tags `v*.*.*`, MRs, or master pushes.
 
+### Runners: the Synology Host Runs an Old Kernel
+
+Jobs land on one of two runners, and the split is not cosmetic.
+
+| Runner | Executor | Jobs |
+|---|---|---|
+| Synology instance runner | docker | everything untagged |
+| `nix-build` (HM-iMac, NixOS) | **shell** | `publish:nur-unstable`, `publish:nur-stable` |
+
+The Synology host runs **kernel 4.4.302+**. Containers share the host kernel, so
+anything that installs its **own seccomp filter inside the container fails there**
+with `EINVAL`, no matter what image or `security_opt` is used — `seccomp=unconfined`
+does not help, because the failure is nix/pacman's own `seccomp()` call being
+rejected, not Docker's profile. Two consequences are baked into the CI files:
+
+- **pacman jobs must disable its sandbox before the first `pacman` call.** Every
+  such job does `sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf` first
+  (`build:makepkg`, `publish:aur-git`, `publish:aur-stable`). Omit it and the job
+  dies on `pacman -Syu` with `error restricting syscalls via seccomp: 22!`.
+- **nix jobs cannot run there at all.** They are tagged `nix-build` and run on the
+  NixOS host instead, where nix is native. `filter-syscalls = false` would also
+  work around it, but routing to a modern kernel is preferred.
+
+Jobs that run `git` against the checkout also need
+`git config --global --add safe.directory "$CI_PROJECT_DIR"` — the build directory
+is owned by a different uid than the job user (`fatal: detected dubious ownership`,
+exit 128).
+
+**The `nix-build` runner is a shell executor**, so for those two jobs:
+`image:` is ignored (don't add one), the script runs on the real host with the
+runner service's PATH (git, nix, coreutils, gnused, gnugrep, tar, gzip, xz, openssh
+— but **no `findutils`**), and the build directory is reused between runs, so a
+clone target is `rm -rf`'d before `git clone`. Never install packages there
+(`nix-env -i` would mutate the actual machine's profile on every nightly).
+
+**arm64 packaging is currently parked.** `package:*:arm64` still carry the dead
+`saas-linux-small-arm64` tag on purpose: dropping it would schedule them on an
+amd64 runner and publish amd64 binaries under arm64 filenames. binfmt emulation
+cannot be registered on the Synology host (the `binfmt_misc` `F` flag needs kernel
+4.8). Tracked in wshowlyrics#11, blocked on nix-configurations#34.
+
 ## Release Process
 
 Version strings live in two places and **must be synced before tagging**:
